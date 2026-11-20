@@ -1,0 +1,9 @@
+pyyaml
+cryptography
+httpx
+websockets
+aiohttp
+fastapi
+sqlalchemy
+uvicorn
+psycopg[binary]

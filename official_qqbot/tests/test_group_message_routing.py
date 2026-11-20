@@ -1,0 +1,152 @@
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import bot
+
+
+class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        bot._recent_group_msg_ids.clear()
+        bot._recent_c2c_msg_ids.clear()
+        whitelist = patch.object(bot, "FULL_MESSAGE_GROUP_IDS", {"2000000002"})
+        whitelist.start()
+        self.addCleanup(whitelist.stop)
+
+    async def test_non_at_group_message_is_processed_for_whitelisted_group(self):
+        data = {
+            "group_openid": "2000000002",
+            "id": "msg-whitelist",
+            "author": {"member_openid": "user-openid"},
+            "content": "/help",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_group_message(data, "GROUP_MESSAGE_CREATE")
+
+        process.assert_awaited_once_with(
+            {
+                "type": "group",
+                "group_openid": "2000000002",
+                "user_openid": "user-openid",
+                "limit_user_id": "user-openid",
+                "msg_id": "msg-whitelist",
+                "commands_only": True,
+            },
+            "/help",
+        )
+
+    async def test_non_at_group_message_is_ignored_for_non_whitelisted_group(self):
+        data = {
+            "group_openid": "other-group",
+            "id": "msg-other",
+            "author": {"member_openid": "user-openid"},
+            "content": "/help",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_group_message(data, "GROUP_MESSAGE_CREATE")
+
+        process.assert_not_awaited()
+
+    async def test_at_group_message_is_processed_for_any_group(self):
+        data = {
+            "group_openid": "other-group",
+            "id": "msg-at",
+            "author": {"member_openid": "user-openid"},
+            "content": "@bot /help",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_group_message(data, "GROUP_AT_MESSAGE_CREATE")
+
+        process.assert_awaited_once_with(
+            {
+                "type": "group",
+                "group_openid": "other-group",
+                "user_openid": "user-openid",
+                "limit_user_id": "user-openid",
+                "msg_id": "msg-at",
+            },
+            "/help",
+        )
+
+    async def test_official_mention_markup_is_stripped_before_processing(self):
+        data = {
+            "group_openid": "other-group",
+            "id": "msg-markup-at",
+            "author": {"member_openid": "user-openid"},
+            "content": "<@!1000000001> /help",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_group_message(data, "GROUP_AT_MESSAGE_CREATE")
+
+        process.assert_awaited_once_with(
+            {
+                "type": "group",
+                "group_openid": "other-group",
+                "user_openid": "user-openid",
+                "limit_user_id": "user-openid",
+                "msg_id": "msg-markup-at",
+            },
+            "/help",
+        )
+
+    async def test_duplicate_group_message_id_is_processed_once(self):
+        data = {
+            "group_openid": "2000000002",
+            "id": "msg-duplicate",
+            "author": {"member_openid": "user-openid"},
+            "content": "/help",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_group_message(data, "GROUP_MESSAGE_CREATE")
+            await bot.handle_group_message(data, "GROUP_AT_MESSAGE_CREATE")
+
+        process.assert_awaited_once()
+
+    async def test_duplicate_c2c_message_id_is_processed_once(self):
+        data = {
+            "id": "msg-private-duplicate",
+            "author": {"user_openid": "user-openid"},
+            "content": "/4399",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_c2c_message(data)
+            await bot.handle_c2c_message(data)
+
+        process.assert_awaited_once()
+
+    async def test_c2c_image_is_forwarded_to_message_processing(self):
+        data = {
+            "id": "msg-private-image",
+            "author": {"user_openid": "user-openid"},
+            "content": "",
+            "attachments": [
+                {
+                    "content_type": "image/jpeg",
+                    "url": "https://cdn.example.test/private.jpg",
+                }
+            ],
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_c2c_message(data)
+
+        process.assert_awaited_once_with(
+            {
+                "type": "c2c",
+                "group_openid": "",
+                "user_openid": "user-openid",
+                "limit_user_id": "user-openid",
+                "msg_id": "msg-private-image",
+                "image_urls": ("https://cdn.example.test/private.jpg",),
+            },
+            "",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,549 @@
+import asyncio
+import os
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import bot
+import shared_cooldown
+
+
+class ResourceRestrictStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_file = shared_cooldown.SHARED_FILE
+        shared_cooldown.SHARED_FILE = os.path.join(self.tmp.name, "cooldowns.json")
+        shared_cooldown._cache = {}
+        shared_cooldown._last_load_ts = 0
+
+    def tearDown(self):
+        shared_cooldown.SHARED_FILE = self.old_file
+        shared_cooldown._cache = {}
+        shared_cooldown._last_load_ts = 0
+        self.tmp.cleanup()
+
+    def test_restrict_rule_limits_each_user_within_window(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("163", 1, "day")
+            blocked, count, limit, window = shared_cooldown.check_restrict_limit(
+                "163", "user-a"
+            )
+
+        self.assertFalse(blocked)
+        self.assertEqual((count, limit, window), (0, 1, 86400))
+
+        with patch.object(shared_cooldown.time, "time", return_value=1001):
+            shared_cooldown.record_restrict_usage("163", "user-a")
+            blocked, count, limit, window = shared_cooldown.check_restrict_limit(
+                "163", "user-a"
+            )
+
+        self.assertTrue(blocked)
+        self.assertEqual((count, limit, window), (1, 1, 86400))
+
+        with patch.object(shared_cooldown.time, "time", return_value=1002):
+            blocked, count, _, _ = shared_cooldown.check_restrict_limit("163", "user-b")
+
+        self.assertFalse(blocked)
+        self.assertEqual(count, 0)
+
+    def test_restrict_window_expires_old_usage(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("nfa", 1, "min")
+            shared_cooldown.record_restrict_usage("nfa", "user-a")
+
+        with patch.object(shared_cooldown.time, "time", return_value=1061):
+            blocked, count, limit, window = shared_cooldown.check_restrict_limit(
+                "nfa", "user-a"
+            )
+
+        self.assertFalse(blocked)
+        self.assertEqual((count, limit, window), (0, 1, 60))
+
+    def test_restrict_status_reports_reset_after(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("163", 2, "min")
+            shared_cooldown.record_restrict_usage("163", "user-a")
+
+        with patch.object(shared_cooldown.time, "time", return_value=1025):
+            status = shared_cooldown.get_restrict_status("163", "user-a")
+
+        self.assertFalse(status["blocked"])
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["limit"], 2)
+        self.assertEqual(status["window"], 60)
+        self.assertEqual(status["reset_after"], 35)
+
+    def test_restrict_usage_stats_cover_standard_ranges(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("163", 10, "day")
+            shared_cooldown.record_restrict_usage("163", "user-a")
+        with patch.object(shared_cooldown.time, "time", return_value=995):
+            shared_cooldown.record_restrict_usage("163", "user-b")
+
+        with patch.object(shared_cooldown.time, "time", return_value=1001):
+            stats = shared_cooldown.get_restrict_usage_stats()
+
+        row = next(item for item in stats if item["resource"] == "163")
+        self.assertEqual(row["counts"]["second"], 1)
+        self.assertEqual(row["counts"]["minute"], 2)
+        self.assertEqual(row["counts"]["hour"], 2)
+        self.assertEqual(row["limit_count"], 10)
+
+    def test_restrict_usage_survives_process_restart(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("163", 1, "day")
+            shared_cooldown.record_restrict_usage("163", "user-a")
+
+        shared_cooldown._cache = {}
+        shared_cooldown._last_load_ts = 0
+
+        with patch.object(shared_cooldown.time, "time", return_value=1001):
+            blocked, count, limit, window = shared_cooldown.check_restrict_limit(
+                "163", "user-a"
+            )
+
+        self.assertTrue(blocked)
+        self.assertEqual((count, limit, window), (1, 1, 86400))
+
+    def test_reset_restrict_usage_clears_logs_but_keeps_rules(self):
+        with patch.object(shared_cooldown.time, "time", return_value=1000):
+            shared_cooldown.set_restrict_rule("163", 1, "day")
+            shared_cooldown.record_restrict_usage("163", "user-a")
+
+        shared_cooldown.reset_restrict_usage()
+
+        with patch.object(shared_cooldown.time, "time", return_value=1001):
+            blocked, count, limit, window = shared_cooldown.check_restrict_limit(
+                "163", "user-a"
+            )
+
+        self.assertFalse(blocked)
+        self.assertEqual((count, limit, window), (0, 1, 86400))
+
+
+class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.user_id = "admin-openid"
+        self.ctx = {
+            "type": "c2c",
+            "user_openid": self.user_id,
+            "msg_id": "msg-restrict",
+            "limit_user_id": self.user_id,
+        }
+        self.old_admins = set(bot._admin_set)
+        self.old_state_backend = bot._state_backend
+        bot._admin_set.add(self.user_id)
+        if hasattr(bot, "_active_resource_request_keys"):
+            bot._active_resource_request_keys.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_sign_file = bot.SIGN_FILE
+        bot.SIGN_FILE = os.path.join(self.tmp.name, "sign_official.json")
+        self.old_sign = bot._sign_data
+        bot._sign_data = {self.user_id: {"points": 500, "streak": 1, "last": ""}}
+
+    def tearDown(self):
+        bot._admin_set.clear()
+        bot._admin_set.update(self.old_admins)
+        bot._state_backend = self.old_state_backend
+        bot._sign_data = self.old_sign
+        bot.SIGN_FILE = self.old_sign_file
+        self.tmp.cleanup()
+
+    async def test_restrict_command_sets_rule_for_admin(self):
+        with patch.object(bot._shared_cd, "set_restrict_rule") as set_rule, patch.object(
+            bot, "reply_plain", new_callable=AsyncMock
+        ) as reply_plain:
+            handled = await bot.handle_command(self.ctx, "/restrict 163 1 day")
+
+        self.assertTrue(handled)
+        set_rule.assert_called_once_with("163", 1, "day")
+        reply_plain.assert_awaited_once()
+
+    async def test_reset_limit_command_resets_all_restrict_usage_for_admin(self):
+        with patch.object(bot._shared_cd, "reset_restrict_usage") as reset_usage, patch.object(
+            bot, "reply_plain", new_callable=AsyncMock
+        ) as reply_plain:
+            handled = await bot.handle_command(self.ctx, "/resetLimit")
+
+        self.assertTrue(handled)
+        reset_usage.assert_called_once_with()
+        reply_plain.assert_awaited_once()
+
+    async def test_private_resource_request_does_not_require_bound_email(self):
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = False
+            get_credentials.return_value = (True, "account: demo\npassword: secret")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/4399")
+
+        self.assertTrue(handled)
+        require_email.assert_not_awaited()
+        get_credentials.assert_awaited_once()
+        send_result.assert_awaited_once()
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 498)
+        self.assertIn("剩余积分：498", send_result.await_args.kwargs["quota_text"])
+
+    async def test_sauth_command_only_fetches_sauth(self):
+        with patch.object(
+            bot._shared_cd, "check_rate_limit", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            get_sauth.return_value = (True, "Sauth: token-only")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/sauth")
+
+        self.assertTrue(handled)
+        get_sauth.assert_awaited_once()
+        get_credentials.assert_not_awaited()
+        send_result.assert_awaited_once()
+        self.assertEqual(send_result.await_args.args[2], "sauth")
+        self.assertEqual(send_result.await_args.args[5], "Sauth: token-only")
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 495)
+
+    async def test_group_resource_request_still_requires_bound_email(self):
+        group_ctx = {
+            "type": "group",
+            "user_openid": self.user_id,
+            "group_openid": "group-openid",
+            "msg_id": "msg-group",
+            "limit_user_id": self.user_id,
+        }
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials:
+            require_email.return_value = False
+
+            handled = await bot.handle_command(group_ctx, "/4399")
+
+        self.assertTrue(handled)
+        require_email.assert_awaited_once_with(group_ctx, self.user_id)
+        get_credentials.assert_not_awaited()
+
+    async def test_insufficient_points_4399_does_not_call_upstream(self):
+        bot._sign_data[self.user_id]["points"] = 1
+        with patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            handled = await bot.handle_command(self.ctx, "/4399")
+
+        self.assertTrue(handled)
+        get_credentials.assert_not_awaited()
+        self.assertIn("积分不足", reply.await_args.args[1])
+        self.assertIn("2 积分", reply.await_args.args[1])
+
+    async def test_successful_4399_records_usage_and_spends_points(self):
+        with patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            get_credentials.return_value = (True, "account: demo\npassword: secret")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/4399")
+
+        self.assertTrue(handled)
+        record_usage.assert_called_once_with("4399", self.user_id, ctx=self.ctx)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 498)
+        self.assertIn("剩余积分：498", send_result.await_args.kwargs["quota_text"])
+
+    async def test_concurrent_4399_requests_for_same_user_fetch_once(self):
+        ctx_a = dict(self.ctx, msg_id="msg-resource-a")
+        ctx_b = dict(self.ctx, msg_id="msg-resource-b")
+
+        async def slow_get_sauth():
+            await asyncio.sleep(0.01)
+            return True, "token"
+
+        with patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            get_credentials.side_effect = slow_get_sauth
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(ctx_a, "/4399"),
+                bot.handle_command(ctx_b, "/4399"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        get_credentials.assert_awaited_once()
+        record_usage.assert_called_once_with("4399", self.user_id, ctx=ctx_a)
+        send_result.assert_awaited_once()
+
+    async def test_concurrent_private_and_group_4399_requests_both_deliver(self):
+        private_ctx = dict(self.ctx, msg_id="msg-private-4399")
+        group_ctx = {
+            "type": "group",
+            "user_openid": self.user_id,
+            "group_openid": "group-openid",
+            "msg_id": "msg-group-4399",
+            "limit_user_id": self.user_id,
+        }
+
+        async def slow_get_sauth():
+            await asyncio.sleep(0.01)
+            return True, "token"
+
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            get_credentials.side_effect = slow_get_sauth
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(private_ctx, "/4399"),
+                bot.handle_command(group_ctx, "/4399"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        self.assertEqual(get_credentials.await_count, 2)
+        self.assertEqual(record_usage.call_count, 2)
+        self.assertEqual(send_result.await_count, 2)
+        sent_contexts = [call.args[0] for call in send_result.await_args_list]
+        self.assertIn(private_ctx, sent_contexts)
+        self.assertIn(group_ctx, sent_contexts)
+
+    async def test_restricted_nfa_does_not_call_upstream(self):
+        with patch.object(
+            bot._state_backend,
+            "get_resource_limit_status",
+            return_value={
+                "blocked": True,
+                "count": 1,
+                "limit": 1,
+                "window": 86400,
+                "reset_after": 60,
+            },
+        ), patch.object(bot, "_require_bound_email", new_callable=AsyncMock) as require_email, patch.object(
+            bot.nfa, "get_nfa_token", new_callable=AsyncMock
+        ) as get_nfa, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            require_email.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/nfa")
+
+        self.assertTrue(handled)
+        get_nfa.assert_not_awaited()
+        reply.assert_awaited_once_with(
+            self.ctx,
+            "已达到获取上限\n当前获取：1/1\n限额刷新：1min0s",
+        )
+
+    async def test_hourly_cooldown_163_does_not_call_upstream(self):
+        with patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(True, 1800)
+        ) as check_cooldown, patch.object(
+            bot.sauth, "get_163_credentials", new_callable=AsyncMock
+        ) as get_163_credentials, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            handled = await bot.handle_command(self.ctx, "/163")
+
+        self.assertTrue(handled)
+        get_163_credentials.assert_not_awaited()
+        self.assertIn("每小时只能提取 1 次", reply.await_args.args[1])
+        self.assertIn("30分0秒", reply.await_args.args[1])
+
+    async def test_successful_nfa_records_restrict_usage(self):
+        with patch.object(
+            bot._state_backend,
+            "get_resource_limit_status",
+            side_effect=[
+                {"blocked": False, "count": 0, "limit": 1, "window": 86400, "reset_after": 0},
+                {"blocked": True, "count": 1, "limit": 1, "window": 86400, "reset_after": 86400},
+            ],
+        ), patch.object(bot._state_backend, "record_resource_usage") as record_usage, patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "check_hour_limit", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "record_usage"
+        ), patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.nfa, "get_nfa_token", new_callable=AsyncMock
+        ) as get_nfa, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            get_nfa.return_value = "主人您的nfa来了喵\nTOKEN"
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/nfa")
+
+        self.assertTrue(handled)
+        record_usage.assert_called_once_with("nfa", self.user_id)
+        self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
+
+    async def test_successful_163_records_usage_and_spends_points(self):
+        with patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(False, 0)
+        ) as check_cooldown, patch.object(
+            bot._shared_cd, "record_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_state, patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_163_credentials", new_callable=AsyncMock
+        ) as get_163_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            get_163_credentials.return_value = (True, "account: mail@example.com")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/163")
+
+        self.assertTrue(handled)
+        check_cooldown.assert_called_once_with("163", self.user_id, bot.SAUTH_163_COOLDOWN)
+        record_state.assert_called_once_with("163", self.user_id, ctx=self.ctx)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 450)
+        self.assertIn("剩余积分：450", send_result.await_args.kwargs["quota_text"])
+
+    async def test_points_spending_uses_global_limit_user_id(self):
+        self.ctx["limit_user_id"] = "global-user-openid"
+        bot._sign_data["global-user-openid"] = {"points": 60, "streak": 0, "last": ""}
+        with patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "record_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_state, patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_163_credentials", new_callable=AsyncMock
+        ) as get_163_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            get_163_credentials.return_value = (True, "account: mail@example.com")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/163")
+
+        self.assertTrue(handled)
+        record_state.assert_called_once_with("163", "global-user-openid", ctx=self.ctx)
+        self.assertEqual(bot._sign_data["global-user-openid"]["points"], 10)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 500)
+
+    async def test_concurrent_163_requests_for_same_user_fetch_once(self):
+        ctx_a = dict(self.ctx, msg_id="msg-163-a")
+        ctx_b = dict(self.ctx, msg_id="msg-163-b")
+
+        async def slow_get_163():
+            await asyncio.sleep(0.01)
+            return True, "account: mail@example.com"
+
+        with patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "record_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot.sauth, "get_163_credentials", new_callable=AsyncMock
+        ) as get_163_credentials, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage_state, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            get_163_credentials.side_effect = slow_get_163
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(ctx_a, "/163"),
+                bot.handle_command(ctx_b, "/163"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        get_163_credentials.assert_awaited_once()
+        record_usage_state.assert_called_once_with("163", self.user_id, ctx=ctx_a)
+        send_result.assert_awaited_once()
+
+    async def test_stock_uses_163_inventory_api(self):
+        with patch.object(bot.nfa, "get_nfa_stock", new_callable=AsyncMock) as get_nfa_stock, patch.object(
+            bot.sauth, "get_4399_stock", new_callable=AsyncMock
+        ) as get_4399_stock, patch.object(
+            bot.sauth, "get_163_stock", new_callable=AsyncMock
+        ) as get_163_stock, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            get_nfa_stock.return_value = (True, 2, "")
+            get_4399_stock.return_value = (True, 10, 20, "")
+            get_163_stock.return_value = (True, 2875, 3000, 125, "")
+
+            handled = await bot.handle_command(self.ctx, "/stock")
+
+        self.assertTrue(handled)
+        message = reply.await_args.args[1]
+        self.assertIn("163：2875/3000", message)
+
+
+if __name__ == "__main__":
+    unittest.main()
